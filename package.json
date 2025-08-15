@@ -1,0 +1,20 @@
+{
+  "name": "agency-logo-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "canvas": "^3.1.2",
+    "discord.js": "^14.21.0",
+    "dotenv": "^17.2.1",
+    "sharp": "^0.34.3",
+    "undici": "^7.13.0"
+  }
+}
