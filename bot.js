@@ -1,155 +1,119 @@
-// bot.js — role-gated workflow: save to /output, DM user, post preview, log
-require('dotenv').config();
-const fs = require('fs');
-const path = require('path');
-const { Client, GatewayIntentBits, AttachmentBuilder, EmbedBuilder, PermissionsBitField } = require('discord.js');
-const { request } = require('undici');
-const { compose } = require('./compose');            // ← uses your canvas-based compose
-const { createCanvas, loadImage } = require('canvas');
+// bot.js
+// Node 20+ required (you set "engines": { "node": ">=20" } in package.json)
+// Env needed: DISCORD_TOKEN, (optional) STAFF_ROLE_ID
+// Commands must already be registered by your register.js
 
-const {
-  DISCORD_TOKEN,
-  STAFF_ROLE_ID,        // role allowed to use /agencylogo (admins always allowed)
-  OUTPUT_CHANNEL_ID,    // optional: channel to post a small preview
-} = process.env;
+const { Client, GatewayIntentBits, AttachmentBuilder, PermissionFlagsBits } = require('discord.js');
+const dotenv = require('dotenv');
+dotenv.config();
 
-if (!DISCORD_TOKEN) {
-  console.error('Missing DISCORD_TOKEN in .env');
-  process.exit(1);
+const { compose } = require('./compose'); // <-- your compose.js (uses sans-serif font)
+
+// ---------- Config ----------
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024; // 8MB limit to avoid abuse/timeouts
+const ALLOWED_MIME = new Set(['image/png', 'image/jpeg', 'image/webp']); // no gifs
+const STAFF_ROLE_ID = process.env.STAFF_ROLE_ID || ''; // optional gate
+
+// ---------- Client ----------
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds]
+});
+
+client.once('ready', () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+});
+
+// Small helper: fetch -> Buffer with timeout (Node 20 has global fetch + AbortController)
+async function downloadToBuffer(url, timeoutMs = 25000) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ac.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status} when downloading image`);
+    const arr = await res.arrayBuffer();
+    return Buffer.from(arr);
+  } finally {
+    clearTimeout(t);
+  }
 }
 
-// Ensure output dir exists
-const OUT_DIR = path.join(__dirname, 'output');
-if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR);
-
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
-client.once('ready', () => console.log(`✅ Logged in as ${client.user.tag}`));
+function memberHasStaff(member) {
+  if (!STAFF_ROLE_ID) return true; // no gate configured
+  if (!member) return false;
+  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+  return member.roles.cache.has(STAFF_ROLE_ID);
+}
 
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
+  // /ping
   if (interaction.commandName === 'ping') {
-    return interaction.reply('Pong 🏓');
+    await interaction.reply({ content: 'Pong 🏓', ephemeral: false });
+    return;
   }
 
+  // /agencylogo
   if (interaction.commandName === 'agencylogo') {
-    // ---- Role gate (server only) ----
-    if (interaction.inGuild()) {
-      const member = await interaction.guild.members.fetch(interaction.user.id);
-      const isAdmin = member.permissions.has(PermissionsBitField.Flags.Administrator);
-      const isStaff = STAFF_ROLE_ID ? member.roles.cache.has(STAFF_ROLE_ID) : false;
-      if (!isAdmin && !isStaff) {
-        return interaction.reply({ content: 'Sorry, this command is staff-only.', ephemeral: true });
-      }
+    // 1) Permission gate (optional)
+    if (!memberHasStaff(interaction.member)) {
+      await interaction.reply({ content: '🚫 You do not have permission to use this command.', ephemeral: true });
+      return;
     }
 
-    // ---- Read options ----
-    const upload = interaction.options.getAttachment('upload', true);
-    const name = (interaction.options.getString('name', true) || '').trim();
-    const background = interaction.options.getString('background') || 'solid'; // 'solid' | 'transparent'
-    const style = interaction.options.getString('style') || 'default';         // matches compose.js presets
-    const size = interaction.options.getInteger('size') || 1024;               // 512 | 1024 | 2048
+    // 2) Read options
+    const name = interaction.options.getString('name') || '';
+    const background = interaction.options.getString('background') || 'solid';
+    const attachment = interaction.options.getAttachment('image');
 
-    await interaction.deferReply();
+    // 3) Validate inputs
+    if (!attachment) {
+      await interaction.reply({ content: '❌ You must attach an image (PNG/JPG/WebP).', ephemeral: true });
+      return;
+    }
+    if (attachment.size > MAX_UPLOAD_BYTES) {
+      await interaction.reply({ content: `❌ Image too large. Max ${Math.floor(MAX_UPLOAD_BYTES / (1024 * 1024))}MB.`, ephemeral: true });
+      return;
+    }
+    if (attachment.contentType && !ALLOWED_MIME.has(attachment.contentType)) {
+      await interaction.reply({ content: '❌ Unsupported image type. Use PNG, JPG, or WebP.', ephemeral: true });
+      return;
+    }
+
+    // 4) ACK within 3 seconds
+    await interaction.deferReply(); // public reply (not ephemeral) so users see the image
 
     try {
-      // Validate file type
-      if (!upload?.contentType?.startsWith('image/')) {
-        throw new Error('Upload must be an image file (png/jpg/webp).');
-      }
+      // 5) Download user image with timeout
+      const baseBuffer = await downloadToBuffer(attachment.url, 25000);
 
-      // Fetch attachment
-      const res = await request(upload.url);
-      if (res.statusCode !== 200) throw new Error(`Failed to fetch upload: ${res.statusCode}`);
-      const baseBuffer = Buffer.from(await res.body.arrayBuffer());
-      if (!baseBuffer.length) throw new Error('Downloaded zero bytes from attachment');
-
-      console.log('[agencylogo]', {
-        by: `${interaction.user.tag} (${interaction.user.id})`,
-        guild: interaction.guild?.name || 'DM',
-        len: baseBuffer.length, background, style, size, name
+      // 6) Compose final logo (compose.js must export { compose })
+      const { finalPng } = await compose({
+        baseBuffer,
+        name,
+        background
       });
 
-      // ---- Compose at full size (2048), then downscale if requested ----
-      const { finalPng: fullPng } = await compose({ baseBuffer, name, background, style });
-
-      // Downscale to requested size (keeps PNG)
-      const target = Math.min(Math.max(size, 256), 2048);
-      let finalPng = fullPng;
-      if (target !== 2048) {
-        const src = await loadImage(fullPng);
-        const c = createCanvas(target, target);
-        const ctx = c.getContext('2d');
-        ctx.drawImage(src, 0, 0, target, target);
-        finalPng = c.toBuffer('image/png');
+      // 7) Send final image
+      const file = new AttachmentBuilder(finalPng, { name: `agency-logo-${Date.now()}.png` });
+      await interaction.editReply({
+        content: `Here’s your badge • **${name || 'NO NAME'}**`,
+        files: [file]
+      });
+    } catch (err) {
+      console.error('[agencylogo]', err);
+      const msg = (err && err.message) ? err.message : 'Unknown error';
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ content: `❌ Failed to generate: ${msg}` });
+      } else {
+        await interaction.reply({ content: `❌ Failed to generate: ${msg}`, ephemeral: true });
       }
-
-      // Small preview (PNG for transparent bg, JPEG otherwise)
-      const previewSize = 512;
-      const pCanvas = createCanvas(previewSize, previewSize);
-      const pCtx = pCanvas.getContext('2d');
-      const pImg = await loadImage(finalPng);
-      pCtx.drawImage(pImg, 0, 0, previewSize, previewSize);
-      const previewIsPng = background === 'transparent';
-      const previewBuf = previewIsPng
-        ? pCanvas.toBuffer('image/png')
-        : pCanvas.toBuffer('image/jpeg', { quality: 0.9 });
-
-      // ---- Save to disk ----
-      const safe = s => (s || 'logo').toUpperCase().replace(/[^A-Z0-9]+/g, '-').replace(/^-+|-+$/g,'').slice(0, 40);
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const baseName = `AGENCY-${safe(name)}-${safe(interaction.user.username)}-${stamp}-${target}`;
-      const fullPath = path.join(OUT_DIR, `${baseName}.png`);
-      fs.writeFileSync(fullPath, finalPng);
-
-      // ---- Reply in channel ----
-      const embed = new EmbedBuilder()
-        .setTitle(`Agency Logo • ${name || 'Untitled'}`)
-        .setDescription(`Style: **${style}** • Background: **${background}** • Size: **${target}px**`)
-        .setFooter({ text: `Saved → output/${baseName}.png` });
-
-      const files = [
-        new AttachmentBuilder(previewBuf, { name: `${baseName}-preview.${previewIsPng ? 'png' : 'jpg'}` }),
-        new AttachmentBuilder(finalPng,   { name: `${baseName}.png` }),
-      ];
-
-      await interaction.editReply({ embeds: [embed], files });
-
-      // ---- DM user (best effort) ----
-      try {
-        await interaction.user.send({
-          content: `Here’s your badge • **${name}**`,
-          files: [new AttachmentBuilder(finalPng, { name: `${baseName}.png` })],
-        });
-      } catch {
-        console.warn('DM failed (user likely has DMs off).');
-      }
-
-      // ---- Optional: post preview to a channel ----
-      if (OUTPUT_CHANNEL_ID) {
-        try {
-          const ch = await client.channels.fetch(OUTPUT_CHANNEL_ID);
-          if (ch?.isTextBased()) {
-            await ch.send({
-              content: `New agency badge: **${name}** by <@${interaction.user.id}>`,
-              files: [new AttachmentBuilder(previewBuf, { name: `${baseName}-preview.${previewIsPng ? 'png' : 'jpg'}` })],
-            });
-          }
-        } catch (e) {
-          console.warn('Posting to OUTPUT_CHANNEL_ID failed:', e?.message);
-        }
-      }
-
-      console.log(`✅ Saved ${fullPath}`);
-    } catch (e) {
-      console.error('❌ Error:', e);
-      await interaction.editReply(`Failed to generate: ${e?.message || 'Unknown error'}`);
     }
   }
 });
 
-client.login(DISCORD_TOKEN);
+// Global safety nets so crashes don’t kill the process silently
+process.on('unhandledRejection', (e) => console.error('UNHANDLED_REJECTION', e));
+process.on('uncaughtException', (e) => console.error('UNCAUGHT_EXCEPTION', e));
 
-// keep process alive on Windows
-setInterval(() => {}, 1 << 30);
+client.login(process.env.DISCORD_TOKEN);
