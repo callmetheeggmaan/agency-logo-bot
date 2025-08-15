@@ -1,8 +1,12 @@
 // compose.js — bg + circular photo + curved text
 // Requires: npm i canvas
-const { createCanvas, loadImage } = require('canvas');
+const { createCanvas, loadImage, registerFont } = require('canvas');
 const fs = require('fs');
 const path = require('path');
+
+// ====== REGISTER CUSTOM FONT ======
+// Make sure the .ttf file is in the same folder or adjust the path
+registerFont(path.join(__dirname, 'YourFont.ttf'), { family: 'YourFontName' });
 
 const SIZE = 2048;
 
@@ -19,7 +23,7 @@ const RING_WIDTH       = 24;
 const RING_COLOR       = '#ffffff';
 
 // ====== TEXT ======
-const FONT_FAMILY       = 'Arial';
+const FONT_FAMILY       = 'YourFontName'; // use your registered font here
 const FONT_WEIGHT       = 'bold';
 const FONT_SIZE         = 136;
 const TEXT_COLOR        = '#e6c76f';
