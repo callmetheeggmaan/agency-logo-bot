@@ -1,29 +1,32 @@
 // bot.js
-// Node 20+ required (you set "engines": { "node": ">=20" } in package.json)
-// Env needed: DISCORD_TOKEN, (optional) STAFF_ROLE_ID
-// Commands must already be registered by your register.js
+// Node 20+ (you set "engines": { "node": ">=20" } in package.json)
 
-const { Client, GatewayIntentBits, AttachmentBuilder, PermissionFlagsBits } = require('discord.js');
+const {
+  Client,
+  GatewayIntentBits,
+  AttachmentBuilder,
+  PermissionFlagsBits
+} = require('discord.js');
 const dotenv = require('dotenv');
 dotenv.config();
 
-const { compose } = require('./compose'); // <-- your compose.js (uses sans-serif font)
+const { compose } = require('./compose'); // your composer (uses sans-serif)
+
+const EPHEMERAL = 64; // InteractionResponseFlags.Ephemeral
 
 // ---------- Config ----------
-const MAX_UPLOAD_BYTES = 8 * 1024 * 1024; // 8MB limit to avoid abuse/timeouts
-const ALLOWED_MIME = new Set(['image/png', 'image/jpeg', 'image/webp']); // no gifs
-const STAFF_ROLE_ID = process.env.STAFF_ROLE_ID || ''; // optional gate
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024; // 8MB
+const ALLOWED_MIME = new Set(['image/png', 'image/jpeg', 'image/webp']);
+const STAFF_ROLE_ID = process.env.STAFF_ROLE_ID || '';
 
 // ---------- Client ----------
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
-});
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 client.once('ready', () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
-// Small helper: fetch -> Buffer with timeout (Node 20 has global fetch + AbortController)
+// Download helper with timeout (uses global fetch on Node 20)
 async function downloadToBuffer(url, timeoutMs = 25000) {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), timeoutMs);
@@ -38,7 +41,7 @@ async function downloadToBuffer(url, timeoutMs = 25000) {
 }
 
 function memberHasStaff(member) {
-  if (!STAFF_ROLE_ID) return true; // no gate configured
+  if (!STAFF_ROLE_ID) return true;
   if (!member) return false;
   if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
   return member.roles.cache.has(STAFF_ROLE_ID);
@@ -49,70 +52,74 @@ client.on('interactionCreate', async (interaction) => {
 
   // /ping
   if (interaction.commandName === 'ping') {
-    await interaction.reply({ content: 'Pong 🏓', ephemeral: false });
+    await interaction.reply({ content: 'Pong 🏓', flags: 0 }); // public
     return;
   }
 
   // /agencylogo
   if (interaction.commandName === 'agencylogo') {
-    // 1) Permission gate (optional)
     if (!memberHasStaff(interaction.member)) {
-      await interaction.reply({ content: '🚫 You do not have permission to use this command.', ephemeral: true });
+      await interaction.reply({
+        content: '🚫 You do not have permission to use this command.',
+        flags: EPHEMERAL
+      });
       return;
     }
 
-    // 2) Read options
     const name = interaction.options.getString('name') || '';
     const background = interaction.options.getString('background') || 'solid';
     const attachment = interaction.options.getAttachment('image');
 
-    // 3) Validate inputs
     if (!attachment) {
-      await interaction.reply({ content: '❌ You must attach an image (PNG/JPG/WebP).', ephemeral: true });
+      await interaction.reply({
+        content: '❌ You must attach an image (PNG/JPG/WebP).',
+        flags: EPHEMERAL
+      });
       return;
     }
     if (attachment.size > MAX_UPLOAD_BYTES) {
-      await interaction.reply({ content: `❌ Image too large. Max ${Math.floor(MAX_UPLOAD_BYTES / (1024 * 1024))}MB.`, ephemeral: true });
+      await interaction.reply({
+        content: `❌ Image too large. Max ${Math.floor(MAX_UPLOAD_BYTES / (1024 * 1024))}MB.`,
+        flags: EPHEMERAL
+      });
       return;
     }
     if (attachment.contentType && !ALLOWED_MIME.has(attachment.contentType)) {
-      await interaction.reply({ content: '❌ Unsupported image type. Use PNG, JPG, or WebP.', ephemeral: true });
+      await interaction.reply({
+        content: '❌ Unsupported image type. Use PNG, JPG, or WebP.',
+        flags: EPHEMERAL
+      });
       return;
     }
 
-    // 4) ACK within 3 seconds
-    await interaction.deferReply(); // public reply (not ephemeral) so users see the image
+    // ACK within 3s (public so the result shows in channel)
+    await interaction.deferReply({ flags: 0 });
 
     try {
-      // 5) Download user image with timeout
       const baseBuffer = await downloadToBuffer(attachment.url, 25000);
+      const { finalPng } = await compose({ baseBuffer, name, background });
 
-      // 6) Compose final logo (compose.js must export { compose })
-      const { finalPng } = await compose({
-        baseBuffer,
-        name,
-        background
+      const file = new AttachmentBuilder(finalPng, {
+        name: `agency-logo-${Date.now()}.png`
       });
 
-      // 7) Send final image
-      const file = new AttachmentBuilder(finalPng, { name: `agency-logo-${Date.now()}.png` });
       await interaction.editReply({
         content: `Here’s your badge • **${name || 'NO NAME'}**`,
         files: [file]
       });
     } catch (err) {
       console.error('[agencylogo]', err);
-      const msg = (err && err.message) ? err.message : 'Unknown error';
+      const msg = err?.message || 'Unknown error';
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply({ content: `❌ Failed to generate: ${msg}` });
       } else {
-        await interaction.reply({ content: `❌ Failed to generate: ${msg}`, ephemeral: true });
+        await interaction.reply({ content: `❌ Failed to generate: ${msg}`, flags: EPHEMERAL });
       }
     }
   }
 });
 
-// Global safety nets so crashes don’t kill the process silently
+// Safety nets
 process.on('unhandledRejection', (e) => console.error('UNHANDLED_REJECTION', e));
 process.on('uncaughtException', (e) => console.error('UNCAUGHT_EXCEPTION', e));
 
